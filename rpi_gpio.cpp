@@ -1,10 +1,15 @@
 #include "rpi_gpio.hpp"
 #include "mailbox.h"
-#include <bcm_host.h>
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <chrono>
 #include <algorithm>
+// detect peripheral base and provide minimal bcm_host helpers so we don't need the old videocore userland
+#include <fstream>
+#include <string>
+#include <cstdint>
+#include <cstring>
+#include <unistd.h>
 
 #define PERIPHERALS_PHYS_BASE 0x7e000000
 #define BCM2835_PERIPHERALS_VIRT_BASE 0x20000000
@@ -88,6 +93,44 @@
 #define EVENTS_LIMIT 1024
 #endif
 #define PAGE_SIZE 4096
+
+static uintptr_t probe_peripheral_base() {
+    // try device tree ranges (big-endian entries: child_bus_addr (8), parent_bus_addr (8), size (8) ...)
+    std::ifstream ranges("/proc/device-tree/soc/ranges", std::ios::binary);
+    if (ranges) {
+        uint8_t buf[8];
+        ranges.read(reinterpret_cast<char*>(buf), sizeof(buf));
+        if (ranges.gcount() >= 8) {
+            // parent_bus_addr is at buf[4..7] for typical layouts
+            uint32_t parent = (uint32_t(buf[4]) << 24) | (uint32_t(buf[5]) << 16) | (uint32_t(buf[6]) << 8) | uint32_t(buf[7]);
+            if (parent) return static_cast<uintptr_t>(parent);
+        }
+    }
+
+    // fallback: try to detect Pi 4/2711 via model string
+    std::ifstream model("/proc/device-tree/model");
+    if (model) {
+        std::string s;
+        std::getline(model, s);
+        if (!s.empty() && s.find("Raspberry Pi 4") != std::string::npos) {
+            return static_cast<uintptr_t>(BCM2711_PERIPHERALS_VIRT_BASE);
+        }
+    }
+
+    // final fallback: older/perhaps 3/2/0/1 families. 0x20000000 is safe fallback for many older kernels.
+    return static_cast<uintptr_t>(BCM2835_PERIPHERALS_VIRT_BASE);
+}
+
+// minimal replacements for the legacy bcm_host API used in this file
+static uintptr_t bcm_host_get_peripheral_address() {
+    return probe_peripheral_base();
+}
+
+static unsigned bcm_host_get_peripheral_size() {
+    // 16MB typical size for peripheral mapping; matches original code expectation
+    return 0x01000000;
+}
+
 
 namespace GPIO {
     struct ClockRegisters {
@@ -542,7 +585,7 @@ namespace GPIO {
                         if (changes) {
                             for (unsigned number = 0; number < GPIO_COUNT; number++) {
                                 if (changes & (0x01 << number)) {
-                                    events.push_back({ time, number, current & (0x01 << number) });
+                                    events.push_back({ time, number, (current & (0x01 << number)) != 0 });
                                 }
                             }
                             previous = current;
